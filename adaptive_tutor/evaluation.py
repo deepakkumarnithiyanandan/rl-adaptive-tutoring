@@ -1,199 +1,162 @@
-"""Matched-scenario policy evaluation and report helpers."""
+"""Held-out-student evaluation for offline policies."""
 
 import csv
 import json
-import time
 from pathlib import Path
-from typing import Protocol
+from typing import Any
 
 import numpy as np
 
-from adaptive_tutor.baselines import (
-    Policy,
-    adaptive_heuristic_policy,
-    random_policy,
-    round_robin_policy,
-)
-from adaptive_tutor.env import TutoringEnv
+from adaptive_tutor.baselines import course_mode_actions, fit_course_mode_policy, random_actions
+from adaptive_tutor.cql import CQLAgent
+from adaptive_tutor.data import OULADData, TransitionDataset
 
 
-class PolicyModel(Protocol):
-    def act(self, observation: np.ndarray, deterministic: bool = True) -> int: ...
+def evaluate_offline_policies(
+    agent: CQLAgent,
+    data: OULADData,
+    seed: int = 123,
+    bootstrap_samples: int = 2000,
+    minimum_action_support: int = 25,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    training = data.splits["train"]
+    test = data.splits["test"]
+    if len(training) == 0 or len(test) == 0:
+        raise ValueError("training and test splits must both contain transitions")
+    if agent.action_names != data.action_names:
+        raise ValueError("checkpoint action vocabulary does not match prepared data")
 
-
-def _policy(name: str, agent: PolicyModel | None, env: TutoringEnv) -> Policy:
-    if name == "ppo":
-        if agent is None:
-            raise ValueError("PPO policy requires a trained agent")
-        return lambda obs, step, rng: agent.act(obs, deterministic=True)
-    if name == "random":
-        return lambda obs, step, rng: random_policy(
-            obs, step, rng, action_count=env.action_count
-        )
-    if name == "round_robin":
-        return lambda obs, step, rng: round_robin_policy(
-            obs,
-            step,
-            rng,
-            num_topics=env.num_topics,
-            difficulty_count=len(env.difficulty_levels),
-            middle_difficulty_index=1,
-        )
-    if name == "adaptive_heuristic":
-        return lambda obs, step, rng: adaptive_heuristic_policy(
-            obs,
-            step,
-            rng,
-            num_topics=env.num_topics,
-            difficulty_levels=env.difficulty_levels,
-        )
-    raise ValueError(f"unknown policy: {name}")
-
-
-def evaluate_policies(
-    policy_names: list[str],
-    episodes: int,
-    split: str,
-    base_seed: int,
-    agent: PolicyModel | None = None,
-) -> dict[str, list[dict[str, float | int | str]]]:
-    if episodes < 1:
-        raise ValueError("episodes must be positive")
-    results: dict[str, list[dict[str, float | int | str]]] = {
-        name: [] for name in policy_names
+    q_values = agent.q_values(test.states)
+    course_modes, fallback = fit_course_mode_policy(training, agent.action_count)
+    actions_by_policy = {
+        "cql_greedy": np.argmax(q_values, axis=1).astype(np.int64),
+        "course_mode": course_mode_actions(test.modules, course_modes, fallback),
+        "random": random_actions(len(test), agent.action_count, seed),
     }
-
-    for episode in range(episodes):
-        scenario_seed = base_seed + episode
-        for name in policy_names:
-            env = TutoringEnv(profile_split=split)
-            observation, _ = env.reset(seed=scenario_seed)
-            initial_mastery = float(env.mastery.mean())
-            policy = _policy(name, agent, env)
-            rng = np.random.default_rng(scenario_seed + 1_000_003)
-            correct_count = 0
-            total_reward = 0.0
-            latencies_ms: list[float] = []
-            done = False
-            while not done:
-                start = time.perf_counter()
-                action = policy(observation, env.steps, rng)
-                latencies_ms.append((time.perf_counter() - start) * 1000.0)
-                observation, reward, done, info = env.step(action)
-                correct_count += int(info["correct"])
-                total_reward += reward
-
-            results[name].append(
+    support_counts = _action_support_by_module(training, data.module_names, agent.action_count)
+    rng = np.random.default_rng(seed)
+    summary: dict[str, Any] = {
+        "evaluation": "held-out students; critic-estimated values and logged-action support",
+        "episodes_or_students": int(np.unique(test.student_ids).size),
+        "test_transitions": len(test),
+        "observed_test_reward_mean": _cluster_mean(test.rewards, test.student_ids),
+        "policies": {},
+        "observed_reward_by_logged_activity": _logged_reward_by_action(
+            test, data.action_names
+        ),
+        "caveats": [
+            "The policy value is a conservative Q-network estimate, not an observed counterfactual outcome.",
+            "OULAD is observational; student-selected resources and scores are confounded.",
+            "Low action support makes critic estimates unreliable; no causal improvement claim is made.",
+        ],
+    }
+    rows: list[dict[str, Any]] = []
+    for policy_name, actions in actions_by_policy.items():
+        indices = np.arange(len(test))
+        estimated_values = q_values[indices, actions]
+        module_indices = {name: index for index, name in enumerate(data.module_names)}
+        support = np.asarray(
+            [
+                support_counts[module_indices[str(module)], int(action)]
+                for module, action in zip(test.modules, actions)
+            ],
+            dtype=np.int64,
+        )
+        policy_summary = {
+            "critic_estimated_value": _cluster_bootstrap(
+                estimated_values, test.student_ids, rng, bootstrap_samples
+            ),
+            "logged_action_match_rate": float(np.mean(actions == test.actions)),
+            "supported_action_rate": float(np.mean(support >= minimum_action_support)),
+            "mean_training_support_per_selected_action": float(support.mean()),
+            "minimum_action_support": minimum_action_support,
+        }
+        summary["policies"][policy_name] = policy_summary
+        for index, action in enumerate(actions):
+            rows.append(
                 {
-                    "scenario_seed": scenario_seed,
-                    "policy": name,
-                    "initial_mastery": initial_mastery,
-                    "final_mastery": float(env.mastery.mean()),
-                    "mastery_gain": float(env.mastery.mean()) - initial_mastery,
-                    "topic_coverage": float(np.mean(env.mastery >= 0.7)),
-                    "correct_rate": correct_count / env.max_steps,
-                    "final_fatigue": float(env.fatigue),
-                    "episode_reward": total_reward,
-                    "steps": env.steps,
-                    "mean_decision_latency_ms": float(np.mean(latencies_ms)),
-                    "p95_decision_latency_ms": float(np.percentile(latencies_ms, 95)),
+                    "policy": policy_name,
+                    "module": str(test.modules[index]),
+                    "recommended_activity": data.action_names[int(action)],
+                    "logged_activity": data.action_names[int(test.actions[index])],
+                    "logged_action_match": bool(action == test.actions[index]),
+                    "training_support_count": int(support[index]),
+                    "critic_estimated_value": float(estimated_values[index]),
+                    "observed_logged_score_delta": float(test.rewards[index]),
                 }
             )
-    return results
+    return summary, rows
 
 
-def summarize_results(
-    results: dict[str, list[dict[str, float | int | str]]],
-    bootstrap_samples: int = 2000,
-    seed: int = 123,
-) -> dict[str, dict[str, dict[str, float]]]:
-    rng = np.random.default_rng(seed)
-    summary: dict[str, dict[str, dict[str, float]]] = {}
-    for policy, rows in results.items():
-        summary[policy] = {}
-        for metric in (
-            "mastery_gain",
-            "final_mastery",
-            "topic_coverage",
-            "correct_rate",
-            "final_fatigue",
-            "mean_decision_latency_ms",
-            "p95_decision_latency_ms",
-        ):
-            values = np.asarray([float(row[metric]) for row in rows], dtype=np.float64)
-            samples = rng.choice(values, size=(bootstrap_samples, len(values)), replace=True)
-            means = samples.mean(axis=1)
-            summary[policy][metric] = {
-                "mean": float(values.mean()),
-                "ci95_low": float(np.percentile(means, 2.5)),
-                "ci95_high": float(np.percentile(means, 97.5)),
-            }
-    return summary
-
-
-def write_episode_csv(
-    results: dict[str, list[dict[str, float | int | str]]], path: str | Path
+def write_evaluation(
+    summary: dict[str, Any],
+    rows: list[dict[str, Any]],
+    output_dir: str | Path,
 ) -> None:
-    rows = [row for policy_rows in results.values() for row in policy_rows]
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / "offline_evaluation.json").open("w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=2)
     if not rows:
-        raise ValueError("cannot write an empty evaluation")
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="", encoding="utf-8") as file:
+        raise ValueError("cannot write evaluation with no test rows")
+    with (output / "policy_estimates.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
 
 
-def write_preference_template(
-    results: dict[str, list[dict[str, float | int | str]]],
-    path: str | Path,
-    seed: int = 123,
-) -> None:
-    ppo_by_seed = {int(row["scenario_seed"]): row for row in results["ppo"]}
-    heuristic_by_seed = {
-        int(row["scenario_seed"]): row for row in results["adaptive_heuristic"]
+def _action_support_by_module(
+    training: TransitionDataset,
+    module_names: tuple[str, ...],
+    action_count: int,
+) -> np.ndarray:
+    module_index = {name: index for index, name in enumerate(module_names)}
+    counts = np.zeros((len(module_names), action_count), dtype=np.int64)
+    for module, action in zip(training.modules, training.actions):
+        counts[module_index[str(module)], int(action)] += 1
+    return counts
+
+
+def _cluster_mean(values: np.ndarray, student_ids: np.ndarray) -> float:
+    means = _per_student_means(values, student_ids)
+    return float(means.mean()) if len(means) else 0.0
+
+
+def _cluster_bootstrap(
+    values: np.ndarray,
+    student_ids: np.ndarray,
+    rng: np.random.Generator,
+    samples: int,
+) -> dict[str, float]:
+    if samples < 1:
+        raise ValueError("bootstrap_samples must be positive")
+    means = _per_student_means(values, student_ids)
+    draws = rng.choice(means, size=(samples, len(means)), replace=True).mean(axis=1)
+    return {
+        "mean_per_student": float(means.mean()),
+        "ci95_low": float(np.percentile(draws, 2.5)),
+        "ci95_high": float(np.percentile(draws, 97.5)),
     }
-    rng = np.random.default_rng(seed)
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fields = (
-        "scenario_seed",
-        "option_a",
-        "option_b",
-        "preferred_option",
-        "comments",
-    )
-    with output.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
-        writer.writeheader()
-        for scenario_seed in sorted(ppo_by_seed):
-            ppo_row = ppo_by_seed[scenario_seed]
-            heuristic_row = heuristic_by_seed[scenario_seed]
-            summaries = [
-                (
-                    "PPO",
-                    f"mastery gain={float(ppo_row['mastery_gain']):.3f}; "
-                    f"coverage={float(ppo_row['topic_coverage']):.2f}; "
-                    f"correct={float(ppo_row['correct_rate']):.2f}; "
-                    f"fatigue={float(ppo_row['final_fatigue']):.2f}",
-                ),
-                (
-                    "Adaptive heuristic",
-                    f"mastery gain={float(heuristic_row['mastery_gain']):.3f}; "
-                    f"coverage={float(heuristic_row['topic_coverage']):.2f}; "
-                    f"correct={float(heuristic_row['correct_rate']):.2f}; "
-                    f"fatigue={float(heuristic_row['final_fatigue']):.2f}",
-                ),
-            ]
-            if rng.integers(2):
-                summaries.reverse()
-            writer.writerow(
-                {
-                    "scenario_seed": scenario_seed,
-                    "option_a": summaries[0][1],
-                    "option_b": summaries[1][1],
-                    "preferred_option": "",
-                    "comments": "",
-                }
-            )
+
+
+def _per_student_means(values: np.ndarray, student_ids: np.ndarray) -> np.ndarray:
+    grouped: dict[str, list[float]] = {}
+    for student, value in zip(student_ids, values):
+        grouped.setdefault(str(student), []).append(float(value))
+    return np.asarray([np.mean(group) for group in grouped.values()], dtype=np.float64)
+
+
+def _logged_reward_by_action(
+    test: TransitionDataset, action_names: tuple[str, ...]
+) -> dict[str, dict[str, float | int]]:
+    result: dict[str, dict[str, float | int]] = {}
+    for action, name in enumerate(action_names):
+        mask = test.actions == action
+        if np.any(mask):
+            result[name] = {
+                "transitions": int(mask.sum()),
+                "mean_observed_score_delta": float(test.rewards[mask].mean()),
+            }
+    return result

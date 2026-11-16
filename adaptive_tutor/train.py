@@ -1,7 +1,8 @@
-"""Train PPO, log diagnostics, and select a checkpoint on validation learners."""
+"""Train Conservative Q-Learning on OULAD's logged student transitions."""
 
 import argparse
 import csv
+import json
 import random
 import time
 from pathlib import Path
@@ -9,9 +10,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from adaptive_tutor.env import TutoringEnv
-from adaptive_tutor.evaluation import evaluate_policies, summarize_results
-from adaptive_tutor.ppo import PPOAgent, generalized_advantages
+from adaptive_tutor.cql import CQLAgent, CQLConfig
+from adaptive_tutor.data import load_or_prepare
 
 
 def train(args: argparse.Namespace) -> None:
@@ -20,111 +20,57 @@ def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     torch.set_num_threads(1)
 
+    data = load_or_prepare(args.archive, args.cache, seed=args.seed)
+    training = data.splits["train"]
+    validation = data.splits["validation"]
+    if len(training) == 0 or len(validation) == 0:
+        raise ValueError("prepared OULAD data must have non-empty train and validation splits")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    env = TutoringEnv(profile_split="train")
-    agent = PPOAgent(env.observation_size, env.action_count)
+    (output_dir / "dataset_report.json").write_text(
+        json.dumps(data.report, indent=2), encoding="utf-8"
+    )
+    agent = CQLAgent(
+        data.state_size,
+        data.action_names,
+        CQLConfig(learning_rate=args.learning_rate, conservative_weight=args.cql_weight),
+    )
+    rng = np.random.default_rng(args.seed)
     training_rows: list[dict[str, float | int]] = []
-    validation_rows: list[dict[str, float | int]] = []
-    best_gain = float("-inf")
-    episode_number = 0
+    best_validation_loss = float("inf")
     started = time.perf_counter()
 
     for update in range(1, args.updates + 1):
-        rollout_observations: list[np.ndarray] = []
-        rollout_actions: list[int] = []
-        rollout_log_probabilities: list[float] = []
-        rollout_advantages: list[float] = []
-        rollout_returns: list[float] = []
-        episode_returns: list[float] = []
-        episode_gains: list[float] = []
-
-        for _ in range(args.episodes_per_update):
-            observation, _ = env.reset(seed=args.seed + episode_number)
-            episode_number += 1
-            observations: list[np.ndarray] = []
-            actions: list[int] = []
-            log_probabilities: list[float] = []
-            rewards: list[float] = []
-            values: list[float] = []
-            total_reward = 0.0
-            initial_mastery = float(env.mastery.mean())
-            done = False
-
-            while not done:
-                action, log_probability, value = agent.sample(observation)
-                next_observation, reward, done, _ = env.step(action)
-                observations.append(observation)
-                actions.append(action)
-                log_probabilities.append(log_probability)
-                rewards.append(reward)
-                values.append(value)
-                total_reward += reward
-                observation = next_observation
-
-            advantages, returns = generalized_advantages(
-                rewards, values, agent.config.gamma, agent.config.gae_lambda
-            )
-            rollout_observations.extend(observations)
-            rollout_actions.extend(actions)
-            rollout_log_probabilities.extend(log_probabilities)
-            rollout_advantages.extend(advantages.tolist())
-            rollout_returns.extend(returns.tolist())
-            episode_returns.append(total_reward)
-            episode_gains.append(float(env.mastery.mean()) - initial_mastery)
-
-        update_metrics = agent.update(
-            np.asarray(rollout_observations, dtype=np.float32),
-            np.asarray(rollout_actions, dtype=np.int64),
-            np.asarray(rollout_log_probabilities, dtype=np.float32),
-            np.asarray(rollout_advantages, dtype=np.float32),
-            np.asarray(rollout_returns, dtype=np.float32),
+        indices = rng.integers(0, len(training), size=args.batch_size)
+        metrics = agent.update(
+            training.states[indices],
+            training.actions[indices],
+            training.rewards[indices],
+            training.next_states[indices],
+            training.dones[indices],
         )
-        training_rows.append(
-            {
-                "update": update,
-                "mean_episode_reward": float(np.mean(episode_returns)),
-                "mean_mastery_gain": float(np.mean(episode_gains)),
-                "policy_loss": update_metrics["policy_loss"],
-                "value_loss": update_metrics["value_loss"],
-                "entropy": update_metrics["entropy"],
-                "approx_kl": update_metrics["approx_kl"],
-            }
-        )
+        training_rows.append({"update": update, **metrics})
 
-        if update % args.eval_interval == 0 or update == 1 or update == args.updates:
-            validation = evaluate_policies(
-                ["ppo"],
-                episodes=args.validation_episodes,
-                split="validation",
-                base_seed=args.validation_seed,
-                agent=agent,
-            )["ppo"]
-            metrics = summarize_results({"ppo": validation})["ppo"]
-            validation_gain = metrics["mastery_gain"]["mean"]
-            validation_rows.append(
-                {
-                    "update": update,
-                    "mastery_gain": validation_gain,
-                    "mastery_gain_ci95_low": metrics["mastery_gain"]["ci95_low"],
-                    "mastery_gain_ci95_high": metrics["mastery_gain"]["ci95_high"],
-                    "final_mastery": metrics["final_mastery"]["mean"],
-                    "topic_coverage": metrics["topic_coverage"]["mean"],
-                }
+        if update % args.eval_interval == 0 or update == args.updates:
+            validation_loss = agent.validation_td_loss(
+                validation.states,
+                validation.actions,
+                validation.rewards,
+                validation.next_states,
+                validation.dones,
             )
             agent.save(output_dir / "latest_policy.pt")
-            if validation_gain > best_gain:
-                best_gain = validation_gain
+            if validation_loss < best_validation_loss:
+                best_validation_loss = validation_loss
                 agent.save(output_dir / "best_policy.pt")
             print(
-                f"update={update:4d} "
-                f"train_return={np.mean(episode_returns):.3f} "
-                f"validation_mastery_gain={validation_gain:.3f} "
-                f"best={best_gain:.3f}"
+                f"update={update:5d} "
+                f"train_bellman={metrics['bellman_loss']:.4f} "
+                f"validation_td={validation_loss:.4f} "
+                f"best={best_validation_loss:.4f}"
             )
 
     _write_rows(output_dir / "training.csv", training_rows)
-    _write_rows(output_dir / "validation.csv", validation_rows)
     print(f"Training completed in {time.perf_counter() - started:.1f}s")
     print(f"Selected checkpoint: {output_dir / 'best_policy.pt'}")
 
@@ -140,16 +86,18 @@ def _write_rows(path: Path, rows: list[dict[str, float | int]]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--updates", type=int, default=200)
-    parser.add_argument("--episodes-per-update", type=int, default=8)
-    parser.add_argument("--validation-episodes", type=int, default=40)
-    parser.add_argument("--validation-seed", type=int, default=20_000)
-    parser.add_argument("--eval-interval", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--archive", default="data/raw/oulad.zip")
+    parser.add_argument("--cache", default="artifacts/oulad_transitions.npz")
     parser.add_argument("--output-dir", default="artifacts")
+    parser.add_argument("--updates", type=int, default=3000)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--eval-interval", type=int, default=100)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--cql-weight", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
-    if args.updates < 1 or args.episodes_per_update < 1 or args.eval_interval < 1:
-        parser.error("updates, episodes-per-update, and eval-interval must be positive")
+    if args.updates < 1 or args.batch_size < 1 or args.eval_interval < 1:
+        parser.error("updates, batch-size, and eval-interval must be positive")
     train(args)
 
 

@@ -1,4 +1,4 @@
-"""Evaluate the selected PPO checkpoint against simple tutoring baselines."""
+"""Evaluate a CQL policy on students held out from training."""
 
 import argparse
 import json
@@ -6,66 +6,38 @@ from pathlib import Path
 
 import torch
 
-from adaptive_tutor.evaluation import (
-    evaluate_policies,
-    summarize_results,
-    write_episode_csv,
-    write_preference_template,
-)
-from adaptive_tutor.ppo import PPOAgent
+from adaptive_tutor.cql import CQLAgent
+from adaptive_tutor.data import load_or_prepare
+from adaptive_tutor.evaluation import evaluate_offline_policies, write_evaluation
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", default="artifacts/best_policy.pt")
-    parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=50_000)
+    parser.add_argument("--archive", default="data/raw/oulad.zip")
+    parser.add_argument("--cache", default="artifacts/oulad_transitions.npz")
     parser.add_argument("--output-dir", default="artifacts")
-    parser.add_argument("--preference-template")
+    parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
-    if args.episodes < 1:
-        parser.error("episodes must be positive")
 
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.is_file():
+        parser.error(f"checkpoint not found: {checkpoint_path}; train a policy first")
     torch.set_num_threads(1)
-    checkpoint = Path(args.checkpoint)
-    if not checkpoint.is_file():
-        parser.error(f"checkpoint not found: {checkpoint}; train a policy first")
-    agent = PPOAgent.load(checkpoint)
-    names = ["ppo", "adaptive_heuristic", "round_robin", "random"]
-    results = evaluate_policies(
-        names,
-        episodes=args.episodes,
-        split="test",
-        base_seed=args.seed,
-        agent=agent,
-    )
-    summary = summarize_results(results)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_episode_csv(results, output_dir / "test_episodes.csv")
-    with (output_dir / "test_summary.json").open("w", encoding="utf-8") as file:
-        json.dump(
-            {
-                "evaluation_split": "test",
-                "episodes_per_policy": args.episodes,
-                "summary": summary,
-            },
-            file,
-            indent=2,
-        )
-    if args.preference_template:
-        write_preference_template(results, args.preference_template, seed=args.seed)
-
-    for name in names:
-        score = summary[name]["mastery_gain"]
-        latency = summary[name]["mean_decision_latency_ms"]["mean"]
+    data = load_or_prepare(args.archive, args.cache)
+    agent = CQLAgent.load(checkpoint_path)
+    summary, rows = evaluate_offline_policies(agent, data, seed=args.seed)
+    write_evaluation(summary, rows, args.output_dir)
+    for name, metrics in summary["policies"].items():
+        value = metrics["critic_estimated_value"]
         print(
-            f"{name:18s} mastery_gain={score['mean']:.3f} "
-            f"95% CI=[{score['ci95_low']:.3f}, {score['ci95_high']:.3f}] "
-            f"latency={latency:.4f}ms/decision"
+            f"{name:14s} estimated_Q={value['mean_per_student']:.4f} "
+            f"95% CI=[{value['ci95_low']:.4f}, {value['ci95_high']:.4f}] "
+            f"action_support={metrics['supported_action_rate']:.1%} "
+            f"logged_match={metrics['logged_action_match_rate']:.1%}"
         )
-    print(f"Episode results: {output_dir / 'test_episodes.csv'}")
-    print(f"Aggregate summary: {output_dir / 'test_summary.json'}")
+    print(f"Observed held-out score delta: {summary['observed_test_reward_mean']:.4f}")
+    print(f"Evaluation report: {Path(args.output_dir) / 'offline_evaluation.json'}")
 
 
 if __name__ == "__main__":
