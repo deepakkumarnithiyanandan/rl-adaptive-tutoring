@@ -1,7 +1,7 @@
 # Offline Adaptive Learning with Real Student Data
 
 This project uses the **Open University Learning Analytics Dataset (OULAD)**,
-not a synthetic learner simulator. It trains a Conservative Q-Learning (CQL)
+. It trains a Conservative Q-Learning (CQL)
 policy from historical student interactions to recommend a course activity
 type (for example, `resource`, `quiz`, or `forumng`) before the next assessment.
 
